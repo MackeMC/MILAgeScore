@@ -1,0 +1,67 @@
+# Example Configuration for MILAgeScore
+# This file defines the hyperparameters and data settings for training and evaluation.
+
+data:
+  # Paths to input data
+  features_path: "data/raw/output_full_dset.csv"    # CSV containing cell-level features
+  labels_path: "data/raw/output_labels.csv"        # CSV containing metadata (Age/Passage, Well, Cell Line)
+  processed_dir: "data/processed/"                 # Where to save/load cached .npy files and scalers
+  
+  # Selection logic
+  feature_set: "both"        # Options: "manual", "latent", or "both". 
+                             # "manual" uses engineered features, "latent" uses deep embeddings.
+  
+  # Data Cleaning
+  variance_threshold: 0.001  # Removes features with very low variance (near constant).
+  correlation_filter: false  # If true, removes highly redundant features.
+  correlation_threshold: 0.95 
+
+bags:
+  # Multiple Instance Learning (MIL) parameters
+  cells_per_bag: 100         # Number of cells sampled to form a single "instance" for the model.
+                             # Larger bags give more stable signals but use more memory.
+  bags_per_group: 16         # Number of bags to generate per unique well/sample during training.
+                             # Increasing this acts as a form of data augmentation.
+  max_well_fraction: 0.35    # Maximum percentage of a well's total cells allowed in one bag.
+                             # Ensures the model doesn't overfit to specific cells.
+  random_seed: 42
+
+model:
+  # Architecture dimensions
+  encoder_hidden: 256        # Width of the Instance Encoder layers.
+  embedding_dim: 128         # Size of the latent space before aggregation.
+  attention_dim: 64          # Bottleneck size in the Gated Attention mechanism.
+  head_hidden: 64            # Size of the hidden layer in the CORN ranking head.
+  
+  # Regularisation
+  dropout_encoder: 0.3       # Dropout in the feature processing stage.
+  dropout_attention: 0.25    # Dropout in the aggregation stage.
+  dropout_head: 0.3          # Dropout in the final ranking stage.
+
+training:
+  epochs: 100
+  batch_size: 16             # Number of bags processed per gradient update.
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  val_fraction: 0.2          # Percentage of data used for validation (if not using LOCO).
+  patience: 15               # Early stopping: epochs to wait for improvement before halting.
+  lambda_aux: 0.0            # Weight for auxiliary loss (if implemented).
+  force_cpu: false           # Set to true to bypass GPU acceleration.
+
+validation:
+  # "group" = Standard random split by sample.
+  # "loco"  = Leave-One-Cell-Line-Out (train on all lines except 'held_out_line').
+  scheme: "loco"          
+  held_out_line: "2"      # The specific identifier of the cell line to hold out for testing.
+
+evaluate:
+  n_bag_samples: 30           # Number of random bags to average over for the final Age Score.
+                              # Higher numbers produce a more precise and stable score.
+  n_bag_samples_explain: 10   # Number of bags used for Integrated Gradients attribution.
+                              # Keep low as IG is computationally expensive.
+
+wandb:
+  # Experiment Tracking
+  project: "MILAgeScore_v2"
+  run_name: "loco_test_1"
+  tags: ["MIL", "ordinal", "senescence"]

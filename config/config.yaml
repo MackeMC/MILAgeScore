@@ -1,0 +1,80 @@
+data:
+  features_path: "data/raw/output_full_dset.csv"     # For use if embeddings and manual feats are together: latent feat cols have "latent" in name
+  manual_features_path: "na"                  # Use this and below if they are separated, use "na" if not using
+  latent_embeddings_path: "na"
+  labels_path: "data/raw/output_labels.csv"   # path to labels metaadata file
+  processed_dir: "data/processed/"
+  # Select which feature blocks to use when training/evaluating the model.
+  # one of: "both" | "manual" | "latent"
+  feature_set: "both"
+
+  grouping:
+    mode: "individual"   # "individual" or "binned"
+    n_bins: 5
+
+  variance_threshold: 0.001
+  correlation_filter: false
+  correlation_threshold: 0.95
+  latent_collapse_threshold: 0.01
+
+bags:
+  cells_per_bag: 100
+  bags_per_group: 128
+  val_bags_per_group: 5
+  max_well_fraction: 0.35
+  random_seed: 48
+  # w_manual and w_latent are resolved automatically as sqrt(n_latent/n_manual)
+  # Uncomment to override:
+  # w_manual: 4.427
+  # w_latent: 1.0
+
+model:
+  encoder_hidden: 64
+  embedding_dim: 128
+  attention_dim: 64
+  head_hidden: 64
+  dropout_encoder: 0.3
+  dropout_attention: 0.25
+  dropout_head: 0.3
+  # in_features and num_classes are resolved at runtime from data — do not set here
+
+
+training:
+  epochs: 100
+  batch_size: 32
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  val_fraction: 0.2
+  patience: 15
+  early_stop_min_delta: 0.0001
+  scheduler_patience: 7
+  min_lr: 0.000001
+  max_grad_norm: 1.0
+  lambda_aux: 0.0
+  force_cpu: false
+
+# ── Validation scheme ────────────────────────────────────────────────────────
+# scheme: "group"  → within-line passage hold-out (default; both lines in train+val)
+#         "loco"   → leave-one-cell-line-out (train on all lines except held_out_line,
+#                    validate on held_out_line). Tests generalisation to unseen biology.
+validation:
+  scheme: "group"          # "group" for the fix-confirmation run, "loco" for generalisation
+  held_out_line: "2"      # cell line to hold out (string, matches standardised column)
+
+evaluate:
+  n_bag_samples: 30           # bags to average over for stable age score
+  n_bag_samples_explain: 20   # bags per group for IG (expensive — keep lower)
+  n_bag_samples_attention: 1000     # new — feeds attention coverage only,
+  checkpoint_path: null      # null = auto-resolve from wandb run name + outputs dir
+
+
+outputs:
+  checkpoint_dir: "outputs/checkpoints/"
+  log_dir:        "outputs/logs/"
+  figure_dir:     "outputs/figures/"
+
+wandb:
+  project: "MILAgeScore_v2"
+  run_name: "baseline_v2_bag_100"
+  tags: ["MIL", "ordinal", "senescence", "CORN"]
+  notes: "refining the model parameters"

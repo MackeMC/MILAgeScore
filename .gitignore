@@ -1,0 +1,8 @@
+/outputs/logs/
+/outputs/figures/
+/outputs/checkpoints/
+/data/raw/
+/data/processed/
+/data/nmn_treatment/
+/ablation/
+/wandb/
