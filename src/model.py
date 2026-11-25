@@ -122,8 +122,12 @@ class AttentionMILAggregator(nn.Module):
         embedding_dim: int = 128,
         attention_dim: int = 64,
         dropout: float = 0.25,
+        pooling: str = "attention",
     ):
         super().__init__()
+        self.pooling = pooling.lower()
+        if self.pooling not in {"attention", "mean"}:
+            raise ValueError(f"Invalid pooling method: {pooling}. Expected 'attention' or 'mean'.")
 
         # Tanh branch
         self.V = nn.Linear(embedding_dim, attention_dim, bias=False)
@@ -147,6 +151,15 @@ class AttentionMILAggregator(nn.Module):
         z       : (batch_size, embedding_dim)  — bag-level representation
         weights : (batch_size, cells_per_bag)  — attention weights (sum to 1 per bag)
         """
+        B, N, D = h.shape
+
+        if self.pooling == "mean":
+            # Bag embedding is unweighted mean of instance embeddings
+            z = h.mean(dim=1)
+            # Return uniform weights so downstream code keeps working
+            weights = torch.full((B, N), 1.0 / N, device=h.device)
+            return z, weights
+
         # Gated attention scores: (B, N, attention_dim)
         gate = torch.tanh(self.V(h)) * torch.sigmoid(self.U(h))
 
@@ -280,6 +293,7 @@ class MILAgeScoreModel(nn.Module):
         dropout_encoder: float = 0.3,
         dropout_attention: float = 0.25,
         dropout_head: float = 0.3,
+        pooling: str = "attention",
     ):
         super().__init__()
 
@@ -294,6 +308,7 @@ class MILAgeScoreModel(nn.Module):
             embedding_dim=embedding_dim,
             attention_dim=attention_dim,
             dropout=dropout_attention,
+            pooling=pooling,
         )
 
         self.corn_head   = CORNHead(
@@ -370,6 +385,7 @@ def build_model(cfg: dict, in_features: int, num_classes: int) -> MILAgeScoreMod
         dropout_encoder=model_cfg.get('dropout_encoder', 0.3),
         dropout_attention=model_cfg.get('dropout_attention', 0.25),
         dropout_head=model_cfg.get('dropout_head', 0.3),
+        pooling=model_cfg.get('pooling', 'attention'),
     )
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -382,7 +398,7 @@ def build_model(cfg: dict, in_features: int, num_classes: int) -> MILAgeScoreMod
           f" → {model_cfg.get('embedding_dim', 128)}")
     print(f"    AttentionAggregator: {model_cfg.get('embedding_dim', 128)}"
           f" → attention_dim={model_cfg.get('attention_dim', 64)} → "
-          f"{model_cfg.get('embedding_dim', 128)}")
+          f"{model_cfg.get('embedding_dim', 128)} (pooling={model_cfg.get('pooling', 'attention')})")
     print(f"    CORNHead          : {model_cfg.get('embedding_dim', 128)}"
           f" → {model_cfg.get('head_hidden', 64)} → {num_classes - 1}")
 

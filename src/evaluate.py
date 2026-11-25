@@ -51,9 +51,9 @@ def load_model_from_checkpoint(
     model.eval()
 
     print(f"Model loaded from checkpoint:")
-    print(f"  Epoch      : {ckpt['epoch']}")
-    print(f"  Val MAE    : {ckpt['val_metrics'].get('val/mae', 'n/a'):.4f}")
-    print(f"  Val ρ      : {ckpt['val_metrics'].get('val/spearman_rho', 'n/a'):.4f}")
+    print(f"  Epoch                  : {ckpt['epoch']}")
+    print(f"  Inner-validation MAE   : {ckpt['val_metrics'].get('val/mae', 'n/a'):.4f}")
+    print(f"  Inner-validation Spearman ρ : {ckpt['val_metrics'].get('val/spearman_rho', 'n/a'):.4f}")
 
     return model, ckpt['cfg'], ckpt['encoder']
 
@@ -180,13 +180,31 @@ def evaluate_passage_trajectory(
     ], axis=1).astype(np.float32)
 
     records = []
-    groups  = labels_df.groupby(['cell_line', 'passage'])
+    # Group by cell_line and passage (or passage_raw if present)
+    group_cols = ['cell_line', 'passage']
+    if 'passage_raw' in labels_df.columns:
+        group_cols = ['cell_line', 'passage_raw']
+    
+    groups = labels_df.groupby(group_cols)
 
-    for (cell_line, passage), grp in tqdm(groups, desc="Evaluating passage trajectory"):
+    for group_vals, grp in tqdm(groups, desc="Evaluating passage trajectory"):
+        if len(group_cols) == 2:
+            cell_line, passage_val = group_vals
+        else:
+            cell_line = group_vals
+            passage_val = grp['passage'].iloc[0]
+        
         idx        = grp.index.values
         group_feats = feats[idx]
         well_names  = grp['well_name'].values
         s_true      = float(grp['s'].iloc[0])
+        passage_raw = grp['passage_raw'].iloc[0] if 'passage_raw' in grp.columns else passage_val
+
+        # Seed selection for reproduction
+        # TASK 1: "Use a different RNG seed per group." 
+        # Deterministic but different per group: use hash of group ID + random_seed
+        group_seed = int(pd.util.hash_pandas_object(pd.Series([cell_line, passage_raw])).iloc[0] % (2**32))
+        eval_seed = cfg.get('bags', {}).get('random_seed', 42) + group_seed
 
         result = predict_group_age_score(
             model=model,
@@ -197,20 +215,26 @@ def evaluate_passage_trajectory(
             cells_per_bag=cells_per_bag,
             n_bag_samples=n_bag_samples,
             max_well_fraction=max_well_frac,
+            random_seed=eval_seed
         )
 
         records.append({
             'cell_line'  : cell_line,
-            'passage'    : passage,
+            'passage'    : grp['passage'].iloc[0],
+            'passage_raw': passage_raw,
             's_true'     : round(s_true, 4),
             's_hat_mean' : round(result['mean_score'], 4),
             's_hat_std'  : round(result['std_score'],  4),
+            's_hat_q05'  : round(float(np.percentile(result['all_scores'], 5)), 4),
+            's_hat_q95'  : round(float(np.percentile(result['all_scores'], 95)), 4),
             'rank_mean'  : round(result['mean_rank'],  3),
             'n_cells'    : len(idx),
+            'all_scores' : result['all_scores'],
+            'all_ranks'  : result['all_ranks'],
         })
 
     trajectory_df = pd.DataFrame(records).sort_values(
-        ['cell_line', 'passage']
+        ['cell_line', 'passage_raw']
     ).reset_index(drop=True)
 
     # Compute Spearman ρ across all groups
@@ -219,10 +243,12 @@ def evaluate_passage_trajectory(
         trajectory_df['s_hat_mean'] - trajectory_df['s_true']
     )))
 
-    print(f"\nPassage Trajectory Evaluation:")
+    print(f"\nHeld-out line Trajectory Evaluation:")
     print(f"  Spearman ρ : {rho:.4f}  (p={pval:.4f})")
     print(f"  MAE (s)    : {mae:.4f}")
-    print(f"\n{trajectory_df.to_string(index=False)}")
+    # Print a summary table without the large array columns
+    display_df = trajectory_df.drop(columns=['all_scores', 'all_ranks'])
+    print(f"\n{display_df.to_string(index=False)}")
 
     return trajectory_df
 
@@ -342,7 +368,9 @@ def save_eval_results(
     out_dir.mkdir(parents=True, exist_ok=True)
 
     trajectory_df.to_csv( out_dir / f'{run_name}_trajectory.csv',   index=False)
-    results_df.to_csv(    out_dir / f'{run_name}_treatments.csv',    index=False)
-    comparisons_df.to_csv(out_dir / f'{run_name}_comparisons.csv',   index=False)
+    if results_df is not None:
+        results_df.to_csv(    out_dir / f'{run_name}_treatments.csv',    index=False)
+    if comparisons_df is not None:
+        comparisons_df.to_csv(out_dir / f'{run_name}_comparisons.csv',   index=False)
 
     print(f"\nEvaluation results saved to {out_dir}")

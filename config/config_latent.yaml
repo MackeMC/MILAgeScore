@@ -1,8 +1,8 @@
 data:
-  features_path: "data/raw/full_dset.csv"     # For use if embeddings and manual feats are together: latent feat cols have "latent" in name
+  features_path: "data/raw/output_full_dset.csv"     # For use if embeddings and manual feats are together: latent feat cols have "latent" in name
   manual_features_path: "na"                  # Use this and below if they are separated, use "na" if not using
   latent_embeddings_path: "na"
-  labels_path: "data/raw/full_dset_labels.csv"   # path to labels metaadata file
+  labels_path: "data/raw/output_labels.csv"   # path to labels metaadata file
   processed_dir: "data/processed/"
   feature_set: "latent"
 

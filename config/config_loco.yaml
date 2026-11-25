@@ -8,17 +8,21 @@ data:
   # one of: "both" | "manual" | "latent"
   feature_set: "both"
 
+  grouping:
+    mode: individual  # "individual" or "binned"
+    n_bins: 10
+
   variance_threshold: 0.001
   correlation_filter: false
   correlation_threshold: 0.95
   latent_collapse_threshold: 0.01
 
 bags:
-  cells_per_bag: 100
-  bags_per_group: 16
-  val_bags_per_group: 16
-  max_well_fraction: 0.35
-  random_seed: 42
+  cells_per_bag: 30
+  bags_per_group: 200
+  val_bags_per_group: 30
+  max_well_fraction: 0.5
+  random_seed: 0
   # w_manual and w_latent are resolved automatically as sqrt(n_latent/n_manual)
   # Uncomment to override:
   # w_manual: 4.427
@@ -37,7 +41,7 @@ model:
 
 training:
   epochs: 100
-  batch_size: 16
+  batch_size: 64
   learning_rate: 0.001
   weight_decay: 0.0001
   val_fraction: 0.2
@@ -56,6 +60,7 @@ training:
 validation:
   scheme: "loco"          # "group" for the fix-confirmation run, "loco" for generalisation
   held_out_line: "2"      # cell line to hold out (string, matches standardised column)
+  n_bins: 10
 
 evaluate:
   n_bag_samples: 30           # bags to average over for stable age score
@@ -64,12 +69,12 @@ evaluate:
 
 
 outputs:
-  checkpoint_dir: "outputs/checkpoints/"
-  log_dir:        "outputs/logs/"
-  figure_dir:     "outputs/figures/"
+  checkpoint_dir: "outputs/loco_HO_L2/checkpoints/"
+  log_dir: "outputs/loco_HO_L2/logs/"
+  figure_dir: "outputs/loco_HO_L2/figures/"
 
 wandb:
-  project: "MILAgeScore_v2"
-  run_name: "loco_test_1"
+  project: "MILAgeScore_LOCO"
+  run_name: "loco_HO_L2"
   tags: ["MIL", "ordinal", "senescence", "CORN"]
-  notes: "LOCO: train line 1 -> validate line 2; full-vocab encoder; continuous-s metrics"
+  notes: "LOCO : train line 1 -> validate line 2; 10 bins"

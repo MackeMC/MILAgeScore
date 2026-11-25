@@ -10,7 +10,7 @@ data:
 
   grouping:
     mode: "binned"   # "individual" or "binned"
-    n_bins: 5
+    n_bins: 10
 
   variance_threshold: 0.001
   correlation_filter: false

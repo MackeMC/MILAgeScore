@@ -27,9 +27,10 @@ import numpy as np
 import pandas as pd
 import torch
 from sklearn.preprocessing import StandardScaler
-from src.utils import resolve_block_weights
+from src.utils import resolve_block_weights, filter_features
 from torch.utils.data import DataLoader, Dataset
 from src.split_loco import split_leave_one_line_out
+from src.binning import prepare_binned_labels, split_binned_kfold
 
 
 # ── Load processed data ────────────────────────────────────────────────────────
@@ -192,7 +193,8 @@ def apply_scalers(
 def save_scalers(
     scaler_manual: StandardScaler,
     scaler_latent: StandardScaler,
-    processed_dir: str
+    processed_dir: str,
+    scaler_dir: str = None
 ):
     """
     Persist fitted scalers to disk.
@@ -206,10 +208,19 @@ def save_scalers(
         pickle.dump(scaler_latent, f)
     print(f"Scalers saved to {d}")
 
+    if scaler_dir:
+        sd = Path(scaler_dir)
+        sd.mkdir(parents=True, exist_ok=True)
+        with open(sd / 'scaler_manual.pkl', 'wb') as f:
+            pickle.dump(scaler_manual, f)
+        with open(sd / 'scaler_latent.pkl', 'wb') as f:
+            pickle.dump(scaler_latent, f)
+        print(f"Scalers also saved to {sd}")
 
-def load_scalers(processed_dir: str) -> tuple[StandardScaler, StandardScaler]:
+
+def load_scalers(processed_dir: str, scaler_dir: str = None) -> tuple[StandardScaler, StandardScaler]:
     """Load previously fitted scalers for inference on new/treatment data."""
-    d = Path(processed_dir)
+    d = Path(scaler_dir) if scaler_dir else Path(processed_dir)
     with open(d / 'scaler_manual.pkl', 'rb') as f:
         scaler_manual = pickle.load(f)
     with open(d / 'scaler_latent.pkl', 'rb') as f:
@@ -282,7 +293,15 @@ class CellBagDataset(Dataset):
             self.group_well_cells[(cell_line, passage)] = well_dict
 
         self.n_groups  = len(self.group_index)
-        self.n_features = features_manual.shape[1] + features_latent.shape[1]
+        n_manual_feats = features_manual.shape[1]
+        n_latent_feats = features_latent.shape[1]
+        self.n_features = n_manual_feats + n_latent_feats
+
+        # ASSERTION: Effective weight of every non-empty block must be > 0
+        if n_manual_feats > 0:
+            assert self.w_manual > 0, f"Manual features present ({n_manual_feats}) but w_manual is {self.w_manual}"
+        if n_latent_feats > 0:
+            assert self.w_latent > 0, f"Latent features present ({n_latent_feats}) but w_latent is {self.w_latent}"
 
         # Warn if any group has fewer cells than cells_per_bag
         for (cell_line, passage, s) in self.group_index:
@@ -322,6 +341,10 @@ class CellBagDataset(Dataset):
         latent_block = self.features_latent[sampled_idx] * self.w_latent
         bag          = np.concatenate([manual_block, latent_block], axis=1)
 
+        # ASSERTION: Sampled bag has non-zero variance across cells
+        # We check if any feature has variance > 0 across the bag
+        assert np.any(np.var(bag, axis=0) > 1e-12), "Sampled bag has zero variance across all features."
+
         return (
             torch.from_numpy(bag),
             torch.tensor(s, dtype=torch.float32),
@@ -358,7 +381,7 @@ class CellBagDataset(Dataset):
 
 
 # ── DataLoader factory ─────────────────────────────────────────────────────────
-def build_dataloaders(processed_dir: str, cfg: dict) -> tuple[DataLoader, DataLoader, StandardScaler, StandardScaler]:
+def build_dataloaders(processed_dir: str, cfg: dict) -> tuple[DataLoader, DataLoader, StandardScaler, StandardScaler] | tuple[DataLoader, DataLoader, DataLoader, StandardScaler, StandardScaler, pd.DataFrame]:
     """
     Full pipeline from processed directory to ready-to-use DataLoaders.
 
@@ -372,33 +395,75 @@ def build_dataloaders(processed_dir: str, cfg: dict) -> tuple[DataLoader, DataLo
 
     Returns
     -------
-    train_loader  : DataLoader
-    val_loader    : DataLoader
-    scaler_manual : fitted StandardScaler (for inference reuse)
-    scaler_latent : fitted StandardScaler (for inference reuse)
+    If inner_val is False:
+        train_loader  : DataLoader
+        val_loader    : DataLoader
+        scaler_manual : fitted StandardScaler (for inference reuse)
+        scaler_latent : fitted StandardScaler (for inference reuse)
+    If inner_val is True:
+        train_loader  : DataLoader
+        inner_val_loader : DataLoader
+        heldout_loader : DataLoader
+        scaler_manual : fitted StandardScaler (for inference reuse)
+        scaler_latent : fitted StandardScaler (for inference reuse)
+        inner_wells_df : pd.DataFrame
     """
     bags_cfg     = cfg['bags']
     training_cfg = cfg['training']
 
     # 1. Load
-    features_manual, features_latent, labels_df, _, _ = load_processed(processed_dir)
+    features_manual, features_latent, labels_df, manual_cols, latent_cols = load_processed(processed_dir)
 
     # Apply feature_set selection by dropping unused blocks
     feature_set = cfg['data'].get('feature_set', 'both').lower()
     if feature_set == 'manual':
         features_latent = np.zeros((features_latent.shape[0], 0), dtype=features_latent.dtype)
+        latent_cols = []
     elif feature_set == 'latent':
         features_manual = np.zeros((features_manual.shape[0], 0), dtype=features_manual.dtype)
+        manual_cols = []
+
+    # Apply feature_include
+    feature_include = cfg['data'].get('feature_include')
+    features_manual, features_latent, _, _ = filter_features(
+        features_manual, features_latent, manual_cols, latent_cols, feature_include
+    )
 
     # 2. Split
     val_cfg = cfg.get('validation', {})
     scheme = val_cfg.get('scheme', 'group').lower()
+    inner_val = val_cfg.get('inner_val', False)
+    inner_wells_df = None
 
-    if scheme == 'loco':
-        train_idx, val_idx = split_leave_one_line_out(
-        labels_df,
-        held_out_line = val_cfg['held_out_line'],
+    if scheme == 'binned_kfold':
+        labels_df = prepare_binned_labels(labels_df, val_cfg.get('n_bins', 10))
+        train_idx, val_idx = split_binned_kfold(
+            labels_df,
+            n_folds=val_cfg.get('n_folds', 5),
+            fold=val_cfg.get('fold', 0),
+            fold_seed=val_cfg.get('fold_seed', 42),
         )
+
+    elif scheme == 'loco':
+        if val_cfg.get('n_bins'):
+            labels_df = prepare_binned_labels(labels_df, val_cfg['n_bins'])
+        line_column = 'cell_line_orig' if 'cell_line_orig' in labels_df.columns else 'cell_line'
+
+        if inner_val:
+            train_idx, inner_idx, val_idx, inner_wells_df = split_leave_one_line_out(
+                labels_df,
+                held_out_line=val_cfg['held_out_line'],
+                line_column=line_column,
+                inner_val=True,
+                inner_val_seed=val_cfg.get('inner_val_seed', bags_cfg['random_seed'])
+            )
+        else:
+            train_idx, val_idx = split_leave_one_line_out(
+                labels_df,
+                held_out_line=val_cfg['held_out_line'],
+                line_column=line_column,
+            )
+
     elif scheme == 'group':
         train_idx, val_idx = split_by_group(labels_df,
             val_fraction = training_cfg['val_fraction'],
@@ -414,7 +479,11 @@ def build_dataloaders(processed_dir: str, cfg: dict) -> tuple[DataLoader, DataLo
     )
 
     # 4. Persist scalers
-    save_scalers(scaler_manual, scaler_latent, processed_dir)
+    scaler_dir = None
+    if 'outputs' in cfg and 'log_dir' in cfg['outputs']:
+        scaler_dir = Path(cfg['outputs']['log_dir']) / 'scalers'
+
+    save_scalers(scaler_manual, scaler_latent, processed_dir, scaler_dir=scaler_dir)
 
     # 5. Compute block-level weights (respect zero-width blocks)
     n_manual = features_manual.shape[1]
@@ -435,18 +504,44 @@ def build_dataloaders(processed_dir: str, cfg: dict) -> tuple[DataLoader, DataLo
         random_seed=bags_cfg['random_seed'],
     )
 
-    val_dataset = CellBagDataset(
-        features_manual=features_manual,
-        features_latent=features_latent,
-        labels_df=labels_df,
-        cell_idx=val_idx,
-        cells_per_bag=bags_cfg['cells_per_bag'],
-        bags_per_group=bags_cfg.get('val_bags_per_group', 30),
-        max_well_fraction=bags_cfg['max_well_fraction'],
-        w_manual=w_manual,
-        w_latent=w_latent,
-        random_seed=bags_cfg['random_seed'] + 1,
-    )
+    if inner_val:
+        inner_dataset = CellBagDataset(
+            features_manual=features_manual,
+            features_latent=features_latent,
+            labels_df=labels_df,
+            cell_idx=inner_idx,
+            cells_per_bag=bags_cfg['cells_per_bag'],
+            bags_per_group=bags_cfg.get('val_bags_per_group', 30),
+            max_well_fraction=bags_cfg['max_well_fraction'],
+            w_manual=w_manual,
+            w_latent=w_latent,
+            random_seed=bags_cfg['random_seed'] + 1,
+        )
+        heldout_dataset = CellBagDataset(
+            features_manual=features_manual,
+            features_latent=features_latent,
+            labels_df=labels_df,
+            cell_idx=val_idx,
+            cells_per_bag=bags_cfg['cells_per_bag'],
+            bags_per_group=bags_cfg.get('val_bags_per_group', 30),
+            max_well_fraction=bags_cfg['max_well_fraction'],
+            w_manual=w_manual,
+            w_latent=w_latent,
+            random_seed=bags_cfg['random_seed'] + 2,
+        )
+    else:
+        val_dataset = CellBagDataset(
+            features_manual=features_manual,
+            features_latent=features_latent,
+            labels_df=labels_df,
+            cell_idx=val_idx,
+            cells_per_bag=bags_cfg['cells_per_bag'],
+            bags_per_group=bags_cfg.get('val_bags_per_group', 30),
+            max_well_fraction=bags_cfg['max_well_fraction'],
+            w_manual=w_manual,
+            w_latent=w_latent,
+            random_seed=bags_cfg['random_seed'] + 1,
+        )
 
     # 7. Wrap in DataLoaders
     # num_workers=0: required on Windows — multiprocessing with custom Dataset
@@ -460,13 +555,31 @@ def build_dataloaders(processed_dir: str, cfg: dict) -> tuple[DataLoader, DataLo
         drop_last=True,
     )
 
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=training_cfg['batch_size'],
-        shuffle=False,
-        num_workers=0,
-        pin_memory=True,
-        drop_last=False,
-    )
-
-    return train_loader, val_loader, scaler_manual, scaler_latent
+    if inner_val:
+        inner_val_loader = DataLoader(
+            inner_dataset,
+            batch_size=training_cfg['batch_size'],
+            shuffle=False,
+            num_workers=0,
+            pin_memory=True,
+            drop_last=False,
+        )
+        heldout_loader = DataLoader(
+            heldout_dataset,
+            batch_size=training_cfg['batch_size'],
+            shuffle=False,
+            num_workers=0,
+            pin_memory=True,
+            drop_last=False,
+        )
+        return train_loader, inner_val_loader, heldout_loader, scaler_manual, scaler_latent, inner_wells_df
+    else:
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=training_cfg['batch_size'],
+            shuffle=False,
+            num_workers=0,
+            pin_memory=True,
+            drop_last=False,
+        )
+        return train_loader, val_loader, scaler_manual, scaler_latent

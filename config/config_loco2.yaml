@@ -1,12 +1,16 @@
 data:
-  features_path: "data/raw/full_dset.csv"     # For use if embeddings and manual feats are together: latent feat cols have "latent" in name
+  features_path: "data/raw/output_full_dset.csv"     # For use if embeddings and manual feats are together: latent feat cols have "latent" in name
   manual_features_path: "na"                  # Use this and below if they are separated, use "na" if not using
   latent_embeddings_path: "na"
-  labels_path: "data/raw/full_dset_labels.csv"   # path to labels metaadata file
+  labels_path: "data/raw/output_labels.csv"   # path to labels metaadata file
   processed_dir: "data/processed/"
   # Select which feature blocks to use when training/evaluating the model.
   # one of: "both" | "manual" | "latent"
   feature_set: "both"
+
+  grouping:
+    mode: individual
+    n_bins: 10
 
   variance_threshold: 0.001
   correlation_filter: true
@@ -14,18 +18,18 @@ data:
   latent_collapse_threshold: 0.01
 
 bags:
-  cells_per_bag: 50
-  bags_per_group: 16
-  val_bags_per_group: 16
-  max_well_fraction: 0.35
-  random_seed: 42
+  cells_per_bag: 100
+  bags_per_group: 200
+  val_bags_per_group: 30
+  max_well_fraction: 0.5
+  random_seed: 0
   # w_manual and w_latent are resolved automatically as sqrt(n_latent/n_manual)
   # Uncomment to override:
   # w_manual: 4.427
   # w_latent: 1.0
 
 model:
-  encoder_hidden: 256
+  encoder_hidden: 64
   embedding_dim: 128
   attention_dim: 64
   head_hidden: 64
@@ -37,7 +41,7 @@ model:
 
 training:
   epochs: 100
-  batch_size: 16
+  batch_size: 64
   learning_rate: 0.001
   weight_decay: 0.0001
   val_fraction: 0.2
@@ -56,6 +60,7 @@ training:
 validation:
   scheme: "loco"          # "group" for the fix-confirmation run, "loco" for generalisation
   held_out_line: "1"      # cell line to hold out (string, matches standardised column)
+  n_bins: 10
 
 evaluate:
   n_bag_samples: 30           # bags to average over for stable age score
@@ -64,12 +69,12 @@ evaluate:
 
 
 outputs:
-  checkpoint_dir: "outputs/checkpoints/"
-  log_dir:        "outputs/logs/"
-  figure_dir:     "outputs/figures/"
+  checkpoint_dir: "outputs/loco_binned_HO_L1/checkpoints/"
+  log_dir: "outputs/loco_binned_HO_L1/logs/"
+  figure_dir: "outputs/loco_binned_HO_L1/figures/"
 
 wandb:
-  project: "MILAgeScore_v2"
-  run_name: "loco_test_2"
+  project: "MILAgeScore_LOCO"
+  run_name: "loco_binned_HO_L1"
   tags: ["MIL", "ordinal", "senescence", "CORN"]
-  notes: "LOCO: train line 2 -> validate line 1; full-vocab encoder; continuous-s metrics"
+  notes: "LOCO binned: train line 2 -> validate line 1; 10 bins"

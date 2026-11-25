@@ -143,7 +143,40 @@ def get_logger(name: str, log_dir: str = None, level=logging.INFO) -> logging.Lo
 
 
 # ── Runtime data shape resolution ─────────────────────────────────────────────
-def resolve_model_dims(processed_dir: str, feature_set: str = 'both') -> tuple[int, int, int]:
+def filter_features(features_manual, features_latent, manual_cols, latent_cols, include_path):
+    """
+    Subset features based on a list of names in include_path.
+    Fail loudly if a requested feature is missing.
+    """
+    if include_path is None:
+        return features_manual, features_latent, manual_cols, latent_cols
+
+    with open(include_path, 'r') as f:
+        include_list = [line.strip() for line in f if line.strip()]
+
+    all_available = set(manual_cols) | set(latent_cols)
+    missing = [f for f in include_list if f not in all_available]
+    if missing:
+        raise ValueError(f"Requested features missing from processed data: {missing}")
+
+    include_set = set(include_list)
+
+    # Indices to keep
+    manual_keep_idx = [i for i, c in enumerate(manual_cols) if c in include_set]
+    latent_keep_idx = [i for i, c in enumerate(latent_cols) if c in include_set]
+
+    new_manual_cols = [manual_cols[i] for i in manual_keep_idx]
+    new_latent_cols = [latent_cols[i] for i in latent_keep_idx]
+
+    if features_manual is not None:
+        features_manual = features_manual[:, manual_keep_idx]
+    if features_latent is not None:
+        features_latent = features_latent[:, latent_keep_idx]
+
+    return features_manual, features_latent, new_manual_cols, new_latent_cols
+
+
+def resolve_model_dims(processed_dir: str, feature_set: str = 'both', feature_include: str = None) -> tuple[int, int, int]:
     """
     Compute in_features and num_classes at runtime from processed data.
 
@@ -156,6 +189,8 @@ def resolve_model_dims(processed_dir: str, feature_set: str = 'both') -> tuple[i
     Parameters
     ----------
     processed_dir : str — path to data/processed/
+    feature_set : str — 'both' | 'manual' | 'latent'
+    feature_include : str — path to text file with feature names to include
 
     Returns
     -------
@@ -170,23 +205,30 @@ def resolve_model_dims(processed_dir: str, feature_set: str = 'both') -> tuple[i
     with open(d / 'latent_cols.pkl', 'rb') as f:
         latent_cols = pickle.load(f)
 
-    # Original counts
-    n_manual_all = len(manual_cols)
-    n_latent_all = len(latent_cols)
-
     # Apply feature set selection
     feature_set = (feature_set or 'both').lower()
     if feature_set not in {'both', 'manual', 'latent'}:
         raise ValueError(f"Invalid data.feature_set='{feature_set}'. Expected one of: both | manual | latent")
 
-    n_manual = n_manual_all if feature_set in {'both', 'manual'} else 0
-    n_latent = n_latent_all if feature_set in {'both', 'latent'} else 0
+    if feature_set == 'manual':
+        latent_cols = []
+    elif feature_set == 'latent':
+        manual_cols = []
+
+    # Apply feature_include
+    _, _, manual_cols, latent_cols = filter_features(
+        None, None, manual_cols, latent_cols, feature_include
+    )
+
+    n_manual = len(manual_cols)
+    n_latent = len(latent_cols)
     in_features = n_manual + n_latent
 
     print(f"Model input dimensions resolved:")
     print(f"  feature_set : {feature_set}")
-    print(f"  n_manual    : {n_manual}  (of {n_manual_all})")
-    print(f"  n_latent    : {n_latent}  (of {n_latent_all})")
+    print(f"  feature_inc : {feature_include}")
+    print(f"  n_manual    : {n_manual}")
+    print(f"  n_latent    : {n_latent}")
     print(f"  in_features : {in_features}")
 
     return in_features, n_manual, n_latent
@@ -206,11 +248,17 @@ def resolve_block_weights(
     total variance contribution across both feature blocks after per-feature
     z-scoring. Overridden by explicit values in config if provided.
     """
-    ratio     = n_latent / n_manual if n_manual > 0 else 1.0
-    default_w = float(np.sqrt(ratio))
+    # Default weights
+    if n_manual > 0 and n_latent > 0:
+        default_w_manual = float(np.sqrt(n_latent / n_manual))
+        default_w_latent = 1.0
+    else:
+        # If one block is empty, the other should be 1.0 by default
+        default_w_manual = 1.0
+        default_w_latent = 1.0
 
-    w_manual  = float(cfg['bags'].get('w_manual', default_w))
-    w_latent  = float(cfg['bags'].get('w_latent', 1.0))
+    w_manual = float(cfg['bags'].get('w_manual', default_w_manual))
+    w_latent = float(cfg['bags'].get('w_latent', default_w_latent))
 
     # If a block is unused (0 features), force its weight to 0 to avoid leaks
     if n_manual == 0:
@@ -219,9 +267,8 @@ def resolve_block_weights(
         w_latent = 0.0
 
     print(f"\nBlock weights:")
-    print(f"  n_manual={n_manual}  n_latent={n_latent}  ratio={ratio:.2f}x")
-    print(f"  w_manual={w_manual:.4f}  w_latent={w_latent:.4f}  "
-          f"({'default sqrt(ratio)' if 'w_manual' not in cfg['bags'] else 'config override'})")
+    print(f"  n_manual={n_manual}  n_latent={n_latent}")
+    print(f"  w_manual={w_manual:.4f}  w_latent={w_latent:.4f}")
 
     return w_manual, w_latent
 

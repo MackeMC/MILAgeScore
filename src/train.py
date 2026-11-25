@@ -349,6 +349,7 @@ def train(
     cfg: dict,
     device: torch.device,
     val_labels_df: pd.DataFrame | None = None,
+    inner_val_loader=None,
 ):
     """
     Full training run with wandb logging, LR scheduling, early stopping,
@@ -356,33 +357,36 @@ def train(
 
     Parameters
     ----------
-    model         : MILAgeScoreModel — already moved to device
-    train_loader  : DataLoader
-    val_loader    : DataLoader
-    criterion     : MILAgeLoss
-    encoder       : OrdinalLabelEncoder (full-vocabulary under LOCO)
-    cfg           : full config dict
-    device        : torch.device
-    val_labels_df : optional per-bag label frame for the val split, used to
-                    build the LOCO per-passage residual table. Pass the
-                    held-out line's bag-level labels if available; otherwise
-                    only scalar LOCO metrics are reported.
+    model            : MILAgeScoreModel — already moved to device
+    train_loader     : DataLoader
+    val_loader       : DataLoader (primary validation, or held-out in inner_val mode)
+    criterion        : MILAgeLoss
+    encoder          : OrdinalLabelEncoder (full-vocabulary under LOCO)
+    cfg              : full config dict
+    device           : torch.device
+    val_labels_df    : optional per-bag label frame for the val split, used to
+                       build the LOCO per-passage residual table.
+    inner_val_loader : optional DataLoader for inner validation (one well per group).
+                       If provided, monitoring/checkpointing uses this.
 
     Returns
     -------
     best_val_metrics : dict — metrics from the epoch with the best monitored value
     """
     training_cfg = cfg['training']
+    val_cfg = cfg.get('validation', {})
 
     # ── Validation scheme ───────────────────────────────────────────────────────
-    scheme   = cfg.get('validation', {}).get('scheme', 'group').lower()
+    scheme   = val_cfg.get('scheme', 'group').lower()
     is_loco  = (scheme == 'loco')
-    held_out = cfg.get('validation', {}).get('held_out_line', None)
+    held_out = val_cfg.get('held_out_line', None)
+    inner_val_enabled = val_cfg.get('inner_val', False)
 
-    # Under LOCO the honest, comparable metric is continuous-s MAE, NOT rank MAE
-    # (rank indices are not aligned across lines). Monitor that for early stop
-    # and checkpoint selection. Otherwise keep the original rank-MAE behaviour.
-    monitor_key = 'loco/mae_s' if is_loco else 'val/mae'
+    # Monitor inner validation if enabled, otherwise loco/mae_s or val/mae
+    if inner_val_enabled:
+        monitor_key = 'val/mae' # calculated on inner_val_loader
+    else:
+        monitor_key = 'loco/mae_s' if is_loco else 'val/mae'
 
     # ── Optimiser ──────────────────────────────────────────────────────────────
     optimizer = torch.optim.AdamW(
@@ -392,8 +396,6 @@ def train(
     )
 
     # ── LR scheduler ───────────────────────────────────────────────────────────
-    # ReduceLROnPlateau monitors the same metric as early stopping; reduces LR
-    # by factor 0.5 after `scheduler_patience` epochs without improvement.
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer,
         mode='min',
@@ -417,18 +419,26 @@ def train(
     best_per_passage  = None
     n_epochs          = training_cfg['epochs']
 
+    # ── Setup per-epoch CSV logging ───────────────────────────────────────────
+    epoch_csv_rows = []
+    log_dir = Path(cfg['outputs'].get('log_dir', '.'))
+    log_dir.mkdir(parents=True, exist_ok=True)
+    run_name = wandb.run.name if wandb.run else 'local'
+    epoch_csv_path = log_dir / f"epochs_{run_name}.csv"
+
     print(f"\nStarting training — {n_epochs} epochs max  |  "
           f"early stop patience={training_cfg['patience']}  |  "
           f"device={device}")
-    if is_loco:
-        print(f"Validation scheme: LOCO  (held-out line {held_out})  "
-              f"|  monitoring '{monitor_key}' (continuous-s MAE)")
+    if inner_val_enabled:
+        print(f"Validation: INNER (seeded wells) | Monitoring '{monitor_key}' on inner-val set")
+    elif is_loco:
+        print(f"Validation: LOCO (held-out line {held_out}) | Monitoring '{monitor_key}'")
     else:
-        print(f"Validation scheme: group within-line  |  monitoring '{monitor_key}'")
-    print(f"{'Epoch':>6}  {'Train Loss':>11}  {'Train MAE':>10}  "
-          f"{'Val Loss':>9}  {'Val MAE':>8}  {'Val ρ':>7}  "
-          f"{'LOCO ρ':>7}  {'MAE_s':>7}  {'LR':>9}  {'ES':>4}")
-    print("─" * 104)
+        print(f"Validation: group within-line | Monitoring '{monitor_key}'")
+
+    print(f"{'Epoch':>6}  {'Train Loss':>11}  {'T-MAE':>7}  "
+          f"{'V-MAE':>7}  {'L-MAE':>7}  {'L-ρ':>7}  {'LR':>9}  {'ES':>4}")
+    print("─" * 90)
 
     for epoch in range(1, n_epochs + 1):
         t0 = time.time()
@@ -439,21 +449,34 @@ def train(
             encoder, device, epoch, cfg
         )
 
-        # ── Validate ───────────────────────────────────────────────────────────
-        (val_metrics, pred_ranks, true_ranks,
-         pred_scores, true_scores) = validate_one_epoch(
-            model, val_loader, criterion, encoder, device, epoch
-        )
+        # ── Validation (Inner or Standard) ──────────────────────────────────────
+        # If inner_val_enabled, val_loader is the held-out line. We use inner_val_loader for monitoring.
+        if inner_val_enabled:
+            # Monitoring set
+            (innerval_metrics, _, _, _, _) = validate_one_epoch(
+                model, inner_val_loader, criterion, encoder, device, epoch
+            )
+            # Held-out set (logged but not monitored)
+            (heldout_metrics, _, _, pred_scores, true_scores) = validate_one_epoch(
+                model, val_loader, criterion, encoder, device, epoch
+            )
+            val_metrics = innerval_metrics
+            loco_val_metrics = heldout_metrics
+        else:
+            (val_metrics, _, _, pred_scores, true_scores) = validate_one_epoch(
+                model, val_loader, criterion, encoder, device, epoch
+            )
+            loco_val_metrics = val_metrics
 
-        # ── LOCO honest continuous-s metrics ─────────────────────────────────────
+        # ── LOCO metrics on held-out line ────────────────────────────────────────
         per_passage = None
         if is_loco:
             loco_block, per_passage = _compute_loco_block(
                 pred_scores, true_scores, val_labels_df
             )
-            val_metrics.update(loco_block)
+            loco_val_metrics.update(loco_block)
 
-        # ── Monitored value (continuous-s MAE under LOCO, else rank MAE) ─────────
+        # ── Monitored value ──────────────────────────────────────────────────────
         monitor_value = val_metrics.get(monitor_key, val_metrics['val/mae'])
 
         # ── LR scheduler step ──────────────────────────────────────────────────
@@ -461,38 +484,70 @@ def train(
         current_lr = optimizer.param_groups[0]['lr']
 
         # ── wandb epoch-level logging ──────────────────────────────────────────
-        wandb.log({
+        log_dict = {
             **train_metrics,
-            **val_metrics,
             'epoch': epoch,
             'learning_rate': current_lr,
-        })
+        }
+        if inner_val_enabled:
+            log_dict.update({f"innerval/{k.split('/')[-1]}": v for k, v in val_metrics.items()})
+            log_dict.update({f"heldout/{k.split('/')[-1]}": v for k, v in loco_val_metrics.items()})
+            # For backward compatibility with monitoring logic in main.py
+            log_dict['val/mae'] = val_metrics['val/mae']
+        else:
+            log_dict.update(val_metrics)
+
+        wandb.log(log_dict)
+
+        # ── Per-epoch CSV row ──────────────────────────────────────────────────
+        csv_row = {
+            'epoch': epoch,
+            'lr': current_lr,
+            'train_loss': train_metrics['train/loss_total'],
+            'train_mae': train_metrics['train/mae'],
+        }
+        if inner_val_enabled:
+            csv_row.update({
+                'innerval_loss': val_metrics['val/loss'],
+                'innerval_mae': val_metrics['val/mae'],
+                'heldout_loss': loco_val_metrics['val/loss'],
+                'heldout_mae_s': loco_val_metrics.get('loco/mae_s', float('nan')),
+                'heldout_spearman': loco_val_metrics.get('loco/spearman_rho', float('nan')),
+            })
+        else:
+            csv_row.update({
+                'val_loss': val_metrics['val/loss'],
+                'val_mae': val_metrics['val/mae'],
+                'loco_mae_s': val_metrics.get('loco/mae_s', float('nan')),
+                'loco_spearman': val_metrics.get('loco/spearman_rho', float('nan')),
+            })
 
         # ── Console output ─────────────────────────────────────────────────────
         elapsed  = time.time() - t0
-        rho      = val_metrics.get('val/spearman_rho', float('nan'))
-        loco_rho = val_metrics.get('loco/spearman_rho', float('nan'))
-        loco_mae = val_metrics.get('loco/mae_s', float('nan'))
+        v_mae    = val_metrics.get('val/mae', float('nan'))
+        l_mae    = loco_val_metrics.get('loco/mae_s', float('nan'))
+        l_rho    = loco_val_metrics.get('loco/spearman_rho', float('nan'))
         es_ctr   = early_stopper.counter
 
         print(
             f"{epoch:>6}  "
             f"{train_metrics['train/loss_total']:>11.4f}  "
-            f"{train_metrics['train/mae']:>10.3f}  "
-            f"{val_metrics['val/loss']:>9.4f}  "
-            f"{val_metrics['val/mae']:>8.3f}  "
-            f"{rho:>7.3f}  "
-            f"{loco_rho:>7.3f}  "
-            f"{loco_mae:>7.3f}  "
+            f"{train_metrics['train/mae']:>7.3f}  "
+            f"{v_mae:>7.3f}  "
+            f"{l_mae:>7.3f}  "
+            f"{l_rho:>7.3f}  "
             f"{current_lr:>9.2e}  "
             f"{es_ctr:>3}/{training_cfg['patience']}"
             f"  [{elapsed:.1f}s]"
         )
 
         # ── Save best checkpoint (by monitored value) ───────────────────────────
+        is_best = False
         if monitor_value < best_monitor:
+            is_best = True
             best_monitor     = monitor_value
-            best_val_metrics = val_metrics.copy()
+            best_val_metrics = (loco_val_metrics.copy() if not inner_val_enabled 
+                                else {**val_metrics, **loco_val_metrics})
             best_per_passage = per_passage
             best_ckpt_path   = save_checkpoint(
                 model, optimizer, scheduler, epoch,
@@ -500,61 +555,32 @@ def train(
             )
             wandb.run.summary['best_monitor_metric']  = monitor_key
             wandb.run.summary['best_monitor_value']   = best_monitor
-            wandb.run.summary['best_val_mae']         = val_metrics['val/mae']
-            wandb.run.summary['best_val_spearman_rho'] = rho
-            if is_loco:
-                wandb.run.summary['best_loco_spearman_rho'] = loco_rho
-                wandb.run.summary['best_loco_mae_s']        = loco_mae
             wandb.run.summary['best_epoch'] = epoch
+        
+        csv_row['is_best'] = int(is_best)
+        epoch_csv_rows.append(csv_row)
 
         # ── Early stopping check (on monitored value) ────────────────────────────
         if early_stopper.step(monitor_value):
-            print(f"\n  Early stopping triggered at epoch {epoch} "
-                  f"(no improvement in '{monitor_key}' for "
-                  f"{training_cfg['patience']} epochs)")
+            print(f"\n  Early stopping triggered at epoch {epoch}")
             break
 
-    # ── Save final epoch checkpoint ────────────────────────────────────────────
-    save_checkpoint(
-        model, optimizer, scheduler, epoch,
-        val_metrics, encoder, cfg, tag='final'
-    )
+    # Save per-epoch CSV
+    pd.DataFrame(epoch_csv_rows).to_csv(epoch_csv_path, index=False)
 
-    print(f"\n{'─' * 104}")
-    print(f"Training complete.")
-    print(f"  Monitored metric      : {monitor_key}  (best {best_monitor:.4f})")
-    print(f"  Best val MAE (rank)   : {best_val_metrics.get('val/mae', float('nan')):.4f}")
-    print(f"  Best val Spearman ρ   : "
-          f"{best_val_metrics.get('val/spearman_rho', float('nan')):.4f}")
-    print(f"  Best val MZOE         : "
-          f"{best_val_metrics.get('val/mzoe', float('nan')):.4f}")
+    # ── Save final and last checkpoints ────────────────────────────────────────
+    save_checkpoint(model, optimizer, scheduler, epoch, val_metrics, encoder, cfg, tag='last')
+    save_checkpoint(model, optimizer, scheduler, epoch, val_metrics, encoder, cfg, tag='final')
+
+    print(f"\n{'─' * 90}")
+    print(f"Training complete. Best inner-validation {monitor_key}: {best_monitor:.4f}")
+
     if is_loco:
-        print(f"  ── LOCO held-out (continuous-s, the honest generalisation number) ──")
-        print(f"  Held-out line         : {held_out}")
-        print(f"  Best LOCO Spearman ρ  : "
-              f"{best_val_metrics.get('loco/spearman_rho', float('nan')):.4f}")
-        print(f"  Best LOCO MAE_s       : "
-              f"{best_val_metrics.get('loco/mae_s', float('nan')):.4f}")
+        l_rho = best_val_metrics.get('loco/spearman_rho', float('nan'))
+        l_mae = best_val_metrics.get('loco/mae_s', float('nan'))
+        print(f"Best held-out line metrics (at best inner-val epoch): Spearman ρ: {l_rho:.4f}  |  MAE_s: {l_mae:.4f}")
         if best_per_passage is not None:
-            print(f"\n  Per-passage residuals on held-out line "
-                  f"(expect larger MAE_s at young passages):")
-            print(best_per_passage.to_string(index=False))
-            # Persist for the thesis figure.
-            out_dir = Path(cfg['outputs'].get('log_dir', '.'))
-            out_dir.mkdir(parents=True, exist_ok=True)
-            run_name = wandb.run.name if wandb.run else 'local'
-            csv_path = out_dir / f"{run_name}_loco_per_passage.csv"
+            csv_path = log_dir / f"{run_name}_loco_per_passage.csv"
             best_per_passage.to_csv(csv_path, index=False)
-            print(f"\n  Per-passage residuals saved → {csv_path}")
-    print(f"  Best checkpoint       : {best_ckpt_path}")
-
-    wandb.log({
-        'final/best_monitor_value'  : best_monitor,
-        'final/best_val_mae'        : best_val_metrics.get('val/mae', float('nan')),
-        'final/best_val_spearman'   : best_val_metrics.get('val/spearman_rho', float('nan')),
-        **({'final/best_loco_spearman': best_val_metrics.get('loco/spearman_rho', float('nan')),
-            'final/best_loco_mae_s'   : best_val_metrics.get('loco/mae_s', float('nan'))}
-           if is_loco else {}),
-    })
 
     return best_val_metrics

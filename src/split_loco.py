@@ -47,8 +47,11 @@ import pandas as pd
 def split_leave_one_line_out(
     labels_df: pd.DataFrame,
     held_out_line,
-    random_seed: int = 42,   # accepted for signature parity with split_by_group; unused
-) -> tuple[np.ndarray, np.ndarray]:
+    random_seed: int = 42, # accepted for signature parity with split_by_group; unused
+    line_column: str = 'cell_line',
+    inner_val: bool = False,
+    inner_val_seed: int = 42,
+    ) -> tuple[np.ndarray, np.ndarray] | tuple[np.ndarray, np.ndarray, np.ndarray, pd.DataFrame]:
     """
     Train on all cell lines except `held_out_line`; validate on `held_out_line`.
 
@@ -56,9 +59,12 @@ def split_leave_one_line_out(
     (train_idx, val_idx) tuple of positional row indices into the
     features/labels arrays.
 
+    If inner_val is True, the training set is further split: one well per
+    (cell_line, passage) group is held out for inner validation.
+
     Parameters
     ----------
-    labels_df     : pd.DataFrame — must contain a 'cell_line' column. Note that
+    labels_df     : pd.DataFrame — must contain the `line_column`. Note that
                     after standardise_labels the cell_line column is a STRING
                     ('1', '2'), so pass held_out_line accordingly (e.g. '2').
     held_out_line : the cell line to hold out for validation. Compared as a
@@ -67,52 +73,87 @@ def split_leave_one_line_out(
     random_seed   : unused — LOCO is deterministic. Present only so this can be
                     swapped in wherever split_by_group(..., random_seed=...) is
                     called.
+    line_column   : the column used to identify cell lines (default: 'cell_line').
+    inner_val     : if True, split the training lines into (train, inner_val) by
+                    holding out one well per (cell_line, passage) group.
+    inner_val_seed: seed for the inner validation well selection.
 
     Returns
     -------
-    train_idx : np.ndarray of int — positional indices for the training lines
-    val_idx   : np.ndarray of int — positional indices for the held-out line
+    If inner_val is False:
+        train_idx : np.ndarray of int — positional indices for the training lines
+        val_idx   : np.ndarray of int — positional indices for the held-out line
+    If inner_val is True:
+        train_idx : np.ndarray of int — training-line indices MINUS inner-val wells
+        inner_idx : np.ndarray of int — one well per (line, passage) from training lines
+        val_idx   : np.ndarray of int — positional indices for the held-out line
+        inner_wells_df : pd.DataFrame — record of which well was held out per group
     """
-    if 'cell_line' not in labels_df.columns:
-        raise ValueError("labels_df must contain a 'cell_line' column.")
+    if line_column not in labels_df.columns:
+        raise ValueError(f"labels_df must contain a '{line_column}' column.")
 
     # Coerce to string to match the standardised column dtype ('1', '2').
-    line_col = labels_df['cell_line'].astype(str).str.strip()
-    held     = str(held_out_line).strip()
+    line_series = labels_df[line_column].astype(str).str.strip()
+    held        = str(held_out_line).strip()
 
-    present = sorted(line_col.unique())
+    present = sorted(line_series.unique())
     if held not in present:
         raise ValueError(
-            f"held_out_line='{held}' not found in data. "
-            f"Available cell lines: {present}"
+            f"held_out_line='{held}' not found in {line_column}. "
+            f"Available values: {present}"
         )
     if len(present) < 2:
         raise ValueError(
-            f"LOCO requires >= 2 cell lines; found only {present}. "
+            f"LOCO requires >= 2 lines in '{line_column}'; found only {present}. "
             f"With a single line there is nothing to hold out."
         )
 
-    val_mask  = (line_col == held).values
+    val_mask  = (line_series == held).values
     val_idx   = np.where(val_mask)[0]
-    train_idx = np.where(~val_mask)[0]
+    train_total_idx = np.where(~val_mask)[0]
 
-    train_lines = sorted(line_col[~val_mask].unique())
+    if not inner_val:
+        train_lines = sorted(line_series[~val_mask].unique())
+        print(f"\nLeave-one-cell-line-out split:")
+        print(f"  Held-out (val) line : {held}  ({len(val_idx)} cells)")
+        print(f"  Train lines         : {train_lines}  ({len(train_total_idx)} cells)")
+        return train_total_idx, val_idx
 
-    print(f"\nLeave-one-cell-line-out split:")
-    print(f"  Held-out (val) line : {held}  ({len(val_idx)} cells)")
-    print(f"  Train lines         : {train_lines}  ({len(train_idx)} cells)")
-    print(f"  Val passages        : "
-          f"{sorted(labels_df.loc[val_mask, 'passage'].unique().tolist())}")
-    print(f"  Train passages      : "
-          f"{sorted(labels_df.loc[~val_mask, 'passage'].unique().tolist())}")
+    # Inner validation: within training lines, hold out one well per group
+    train_df = labels_df.iloc[train_total_idx].copy()
+    train_df['original_index'] = train_total_idx
 
-    if len(train_idx) == 0 or len(val_idx) == 0:
-        raise ValueError(
-            f"LOCO split produced an empty side "
-            f"(train={len(train_idx)}, val={len(val_idx)})."
-        )
+    inner_indices = []
+    inner_wells_record = []
+    rng = np.random.default_rng(inner_val_seed)
 
-    return train_idx, val_idx
+    # Group by cell_line and passage (or passage_raw if present)
+    group_cols = [line_column, 'passage']
+    if 'passage_raw' in train_df.columns:
+        group_cols = [line_column, 'passage_raw']
+
+    for (line, passage), group in train_df.groupby(group_cols):
+        wells = sorted(group['well_name'].unique())
+        chosen_well = rng.choice(wells)
+        well_idx = group[group['well_name'] == chosen_well]['original_index'].values
+        inner_indices.extend(well_idx)
+        inner_wells_record.append({
+            'cell_line': line,
+            'passage_raw': passage, # might be binned 'passage' or real 'passage_raw'
+            'well': chosen_well
+        })
+
+    inner_idx = np.array(inner_indices)
+    train_idx = np.array([i for i in train_total_idx if i not in inner_idx])
+    inner_wells_df = pd.DataFrame(inner_wells_record)
+
+    train_lines = sorted(line_series[~val_mask].unique())
+    print(f"\nLeave-one-cell-line-out split with INNER VALIDATION:")
+    print(f"  Held-out (loco) line : {held}  ({len(val_idx)} cells)")
+    print(f"  Inner-val (wells)    : {len(inner_idx)} cells from {len(inner_wells_df)} wells")
+    print(f"  Train (remaining)    : {len(train_idx)} cells from {train_lines}")
+
+    return train_idx, inner_idx, val_idx, inner_wells_df
 
 
 # ── Full-vocabulary encoder for LOCO ─────────────────────────────────────────────
